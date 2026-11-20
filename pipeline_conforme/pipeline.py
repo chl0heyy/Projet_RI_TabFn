@@ -27,9 +27,19 @@ from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    class tqdm:
+        def __init__(self, it=None, **kwargs): self.it = it or []
+        def __iter__(self): return iter(self.it)
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def update(self, n=1): pass
+
 SCORES = ["lac", "aps", "raps"]
 ALPHAS = [0.05, 0.1, 0.2]
-JACKKNIFE_MAX_N = 2000      # au-delà, jackknife+ (un entraînement par point) est refusé
+JACKKNIFE_MAX_N = 8000      # au-delà, jackknife+ (un entraînement par point) est refusé
 
 
 # 1. Préparation ---------------------------------------------------------------------
@@ -69,6 +79,9 @@ def fit_proba(modele, X_fit, y_fit, X_pred, K):
     """Copie vierge du modèle, entraînée sur (X_fit, y_fit) -> probas de X_pred, toujours K colonnes."""
     presentes = np.unique(y_fit)                       # une classe peut manquer dans un petit pli
     m = clone(modele).fit(X_fit, np.searchsorted(presentes, y_fit))
+    if hasattr(m, "get_booster") and getattr(m, "device", None) not in (None, "cpu"):
+        m.set_params(device="cpu")
+        m.get_booster().set_param({"device": "cpu"})
     P = np.zeros((len(X_pred), K))
     P[:, presentes] = m.predict_proba(X_pred)
     return P
@@ -78,8 +91,11 @@ def calcule_probas(modele, methode, X_tr, y_tr, X_cal, y_cal, X_te, X_D, y_D, K,
     """split : 1 modèle sur train. cv+ : n_plis modèles sur D. jackknife+ : 1 modèle par point de D.
     Renvoie P_cal (probas « hors pli » de la calibration), y_cal, P_test (une matrice par modèle),
     pli (le modèle qui n'a pas vu chaque point de calibration), poids (taille relative des plis)."""
+    desc = f"{type(modele).__name__} [{methode}]"
     if methode == "split":
-        P = fit_proba(modele, X_tr, y_tr, np.vstack([X_cal, X_te]), K)
+        with tqdm(total=1, desc=desc, leave=False) as pbar:
+            P = fit_proba(modele, X_tr, y_tr, np.vstack([X_cal, X_te]), K)
+            pbar.update(1)
         return dict(P_cal=P[:len(X_cal)], y_cal=y_cal, P_test=P[None, len(X_cal):],
                     pli=np.zeros(len(X_cal), int), poids=np.ones(1))
     if methode == "cv+":
@@ -92,7 +108,7 @@ def calcule_probas(modele, methode, X_tr, y_tr, X_cal, y_cal, X_te, X_D, y_D, K,
         raise ValueError(f"methode inconnue : {methode} (split, cv+, jackknife+)")
 
     P_cal, P_test, pli = np.zeros((len(X_D), K)), np.zeros((n_plis, len(X_te), K)), np.zeros(len(X_D), int)
-    for k, (fit, out) in enumerate(kf.split(X_D, y_D)):
+    for k, (fit, out) in enumerate(tqdm(kf.split(X_D, y_D), total=n_plis, desc=desc, leave=False)):
         P = fit_proba(modele, X_D[fit], y_D[fit], np.vstack([X_D[out], X_te]), K)
         P_cal[out], P_test[k], pli[out] = P[:len(out)], P[len(out):], k
     return dict(P_cal=P_cal, y_cal=y_D, P_test=P_test, pli=pli, poids=np.bincount(pli, minlength=n_plis) / len(pli))
